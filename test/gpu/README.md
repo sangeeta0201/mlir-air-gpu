@@ -90,38 +90,143 @@ With GPU-only build, the following passes are available:
 
 AIE-specific passes (e.g., `air-to-aie`) are registered but will emit an error if invoked, indicating that AIE support is required.
 
-## Run GPU Tests
+## GPU Compilation with aircc-gpu.sh
 
-GPU tests are located under `test/gpu/`.
+The `aircc-gpu.sh` script provides an easy way to compile AIR MLIR to GPU targets.
 
-### Example: Running a basic GPU test
+### Quick Start
 
 ```bash
-# From the mlir-air directory
-cd test/gpu
+# Compile the 4k x 4k matrix multiplication example for MI300X
+./utils/aircc-gpu.sh --gpu-arch=gfx942 -o output.mlir test/gpu/4k_4k_mul/air_sync.mlir
 
-# Lower AIR to ROCDL
-air-opt air_sync.mlir -air-to-rocdl -o output_rocdl.mlir
+# With verbose output to see compilation steps
+./utils/aircc-gpu.sh -v --gpu-arch=gfx942 -o output.mlir test/gpu/4k_4k_mul/air_sync.mlir
 
-# Outline GPU kernels
-air-opt output_rocdl.mlir -air-gpu-outlining -o output_outlined.mlir
-
-# Continue with LLVM's GPU lowering pipeline
-mlir-opt output_outlined.mlir \
-    --pass-pipeline="builtin.module(func.func(lower-affine, convert-linalg-to-loops, convert-scf-to-cf), gpu-kernel-outlining)" \
-    -o output_gpu.mlir
-
-# Target MI300X (gfx942)
-mlir-opt output_gpu.mlir \
-    --pass-pipeline="builtin.module(rocdl-attach-target{chip=gfx942 O=3}, gpu.module(convert-gpu-to-rocdl{chipset=gfx942 runtime=HIP}, reconcile-unrealized-casts), gpu-module-to-binary, func.func(gpu-async-region), gpu-to-llvm, convert-to-llvm, reconcile-unrealized-casts)" \
-    -o output_llvm.mlir
-
-# Run with ROCm runtime
-mlir-cpu-runner \
-    --entry-point-result=void \
-    --shared-libs=$LLVM_INSTALL/lib/libmlir_rocm_runtime.so \
-    output_llvm.mlir
+# Keep intermediate files for debugging
+./utils/aircc-gpu.sh -v --gpu-arch=gfx942 --tmpdir=/tmp/mytest -o output.mlir test/gpu/4k_4k_mul/air_sync.mlir
 ```
+
+### aircc-gpu.sh Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-o <file>` | stdout | Output file |
+| `--gpu-arch <arch>` | `gfx942` | GPU architecture |
+| `--gpu-runtime <rt>` | `HIP` | GPU runtime: `HIP` or `OpenCL` |
+| `--tmpdir <dir>` | auto | Directory for intermediate files |
+| `-v, --verbose` | off | Show compilation steps |
+
+### Supported GPU Architectures
+
+| Architecture | GPU |
+|--------------|-----|
+| `gfx942` | MI300X, MI300A |
+| `gfx90a` | MI200 series |
+| `gfx908` | MI100 |
+| `gfx1100` | RDNA3 (RX 7900) |
+
+### Compilation Pipeline
+
+The script runs the following passes:
+
+1. **AIR to ROCDL** (`air-opt -air-to-rocdl`)
+   - Converts `air.launch`, `air.segment`, `air.herd` → `gpu.launch`
+   - Converts `air.dma_memcpy_nd` → memory operations
+
+2. **GPU Kernel Outlining** (`mlir-opt gpu-kernel-outlining`)
+   - Outlines GPU kernels into `gpu.module`
+
+3. **ROCDL Binary Generation** (`mlir-opt convert-gpu-to-rocdl, gpu-module-to-binary`)
+   - Converts GPU dialect to ROCDL
+   - Generates embedded GPU binary
+
+4. **Final Lowering** (`mlir-opt gpu-to-llvm, convert-to-llvm`)
+   - Lowers to LLVM dialect for execution
+
+## GPU Test Examples
+
+### 4k x 4k Matrix Multiplication
+
+The `test/gpu/4k_4k_mul/` directory contains a matrix multiplication example.
+
+```bash
+# Compile the example
+./utils/aircc-gpu.sh -v --gpu-arch=gfx942 \
+    -o /tmp/matmul_output.mlir \
+    test/gpu/4k_4k_mul/air_sync.mlir
+
+# View the generated LLVM IR
+head -100 /tmp/matmul_output.mlir
+```
+
+### Running on GPU
+
+To run the compiled output on an AMD GPU:
+
+```bash
+# Compile to executable
+mlir-cpu-runner /tmp/matmul_output.mlir \
+    --entry-point-result=void \
+    --shared-libs=$PWD/llvm/install/lib/libmlir_rocm_runtime.so \
+    --shared-libs=$PWD/llvm/install/lib/libmlir_runner_utils.so
+```
+
+## Manual Compilation Steps
+
+For more control, you can run the passes manually:
+
+### Step 1: AIR to ROCDL
+
+```bash
+air-opt test/gpu/4k_4k_mul/air_sync.mlir \
+    -air-to-rocdl -canonicalize -cse \
+    -o step1_rocdl.mlir
+```
+
+### Step 2: GPU Kernel Outlining
+
+```bash
+mlir-opt step1_rocdl.mlir \
+    --pass-pipeline="builtin.module(func.func(lower-affine, convert-scf-to-cf), gpu-kernel-outlining)" \
+    -o step2_outlined.mlir
+```
+
+### Step 3: ROCDL Binary Generation
+
+```bash
+mlir-opt step2_outlined.mlir \
+    --pass-pipeline="builtin.module(rocdl-attach-target{chip=gfx942 O=3}, gpu.module(convert-gpu-to-rocdl{chipset=gfx942 runtime=HIP}, reconcile-unrealized-casts), gpu-module-to-binary)" \
+    -o step3_binary.mlir
+```
+
+### Step 4: Final LLVM Lowering
+
+```bash
+mlir-opt step3_binary.mlir \
+    --pass-pipeline="builtin.module(func.func(gpu-async-region), gpu-to-llvm, convert-to-llvm, reconcile-unrealized-casts)" \
+    -o step4_llvm.mlir
+```
+
+## Python AIRCC (Alternative)
+
+The Python `aircc` compiler also supports GPU targets (requires Python bindings):
+
+```bash
+# Compile AIR MLIR to GPU (MI300X)
+aircc.py --target=gpu --gpu-arch=gfx942 input.mlir -o output.mlir
+
+# Auto-detect GPU from device name
+aircc.py --device=gfx942 input.mlir -o output.mlir
+```
+
+### AIRCC Python Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--target` | `aie` | Target backend: `aie` or `gpu` |
+| `--gpu-arch` | `gfx942` | GPU architecture |
+| `--gpu-runtime` | `HIP` | GPU runtime: `HIP` or `OpenCL` |
 
 ## Environment Setup
 
